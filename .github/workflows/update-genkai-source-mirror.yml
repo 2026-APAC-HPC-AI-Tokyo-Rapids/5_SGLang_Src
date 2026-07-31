@@ -1,0 +1,22 @@
+name: Update Genkai source mirror
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-genkai-source-mirror
+  cancel-in-progress: false
+
+jobs:
+  update-mirror:
+    runs-on: [self-hosted, genkai]
+
+    steps:
+      - name: Fetch the shared bare mirror
+        run: >-
+          git -C /fast/pj26000080/git-mirror/5_SGLang_Src.git
+          fetch --prune --prune-tags origin
