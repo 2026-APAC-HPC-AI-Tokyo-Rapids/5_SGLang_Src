@@ -13,10 +13,11 @@ concurrency:
 
 jobs:
   update-mirror:
-    runs-on: [self-hosted, genkai]
+    runs-on: [self-hosted, home-lab]
 
     steps:
       - name: Fetch the shared bare mirror
+        shell: genkai-shell --github-shell {0}
         run: >-
           git -C /fast/pj26000080/git-mirror/5_SGLang_Src.git
           fetch --prune --prune-tags origin
