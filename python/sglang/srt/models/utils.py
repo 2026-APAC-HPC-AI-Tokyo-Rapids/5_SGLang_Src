@@ -292,9 +292,14 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
     pool = get_token_to_kv_pool()
+    # CUDA bf16 KV uses the C++ JIT fused store; CUDA fp8 KV reuses the
+    # cross-platform Triton fused kernel (which casts and applies the per-layer
+    # k/v scales), so allow it here as long as the pool layout is a plain
+    # token pool.
+    fp8_kv_cache = pool.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     return (
         _is_cuda
-        and pool.dtype == torch.bfloat16
+        and (pool.dtype == torch.bfloat16 or fp8_kv_cache)
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
         and getattr(forward_batch, "dcp_kv_mask", None) is None
@@ -316,8 +321,11 @@ def create_fused_set_kv_buffer_arg(
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
 
-    if not _is_hip:
-        # CUDA path.
+    if not _is_hip and token_to_kv_pool.dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        # CUDA bf16 path (C++ JIT fused store).
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
         return FusedSetKVBufferArg(
             value=value,
@@ -326,7 +334,8 @@ def create_fused_set_kv_buffer_arg(
             cache_loc=forward_batch.out_cache_loc,
         )
     else:
-        # ROCm path.
+        # Triton fused store: always on ROCm, and on CUDA for fp8 KV so the
+        # rotate, cast and per-layer scaling happen in one kernel.
         page_size = token_to_kv_pool.page_size
         # A non-hybrid pool has no full->SWA remap: SWA and full layers
         # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory

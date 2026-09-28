@@ -368,6 +368,46 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(fused_set_kv_buffer_arg, dict):
+            # Cross-platform Triton fused RoPE + KV store. Used on ROCm and on
+            # CUDA for an fp8 KV cache so the rotate, cast and per-layer scaling
+            # happen in a single kernel instead of a separate cast store.
+            from sglang.kernels.ops.attention.utils import (
+                fused_qk_rope_reshape_and_cache,
+            )
+
+            extra_args = fused_set_kv_buffer_arg
+            k_cache = fused_set_kv_buffer_arg["key_cache"]
+            # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+            # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
+            is_shuffle_5d = k_cache.ndim == 5
+            if is_shuffle_5d:
+                # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
+                qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
+                tp_k_head_num = k_cache.shape[1]
+            else:
+                qk_head_dim = k_cache.shape[-1]
+                tp_k_head_num = k_cache.shape[-2]
+
+            key = key.view(-1, tp_k_head_num, qk_head_dim)
+            tokens = key.shape[0]
+            query = query.view(tokens, -1, qk_head_dim)
+
+            query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q=query,
+                k=key,
+                pos=positions,
+                cos_sin=self.cos_sin_cache,
+                is_neox=self.is_neox_style,
+                flash_layout=not is_shuffle_5d,
+                offs=None,
+                q_out=query,
+                k_out=key,
+                output_zeros=False,
+                **extra_args,
+            )
+            return query, key
+
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
@@ -384,53 +424,20 @@ class RotaryEmbedding(MultiPlatformOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-
-            if fused_set_kv_buffer_arg is not None and _is_hip:
-                extra_args = fused_set_kv_buffer_arg
-                k_cache = fused_set_kv_buffer_arg["key_cache"]
-                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
-                # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
-                is_shuffle_5d = k_cache.ndim == 5
-                if is_shuffle_5d:
-                    # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
-                    qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
-                    tp_k_head_num = k_cache.shape[1]
-                else:
-                    qk_head_dim = k_cache.shape[-1]
-                    tp_k_head_num = k_cache.shape[-2]
-
-                key = key.view(-1, tp_k_head_num, qk_head_dim)
-                tokens = key.shape[0]
-                query = query.view(tokens, -1, qk_head_dim)
-
-                query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-                    q=query,
-                    k=key,
-                    pos=positions,
-                    cos_sin=self.cos_sin_cache,
-                    is_neox=self.is_neox_style,
-                    flash_layout=not is_shuffle_5d,
-                    offs=None,
-                    q_out=query,
-                    k_out=key,
-                    output_zeros=False,
-                    **extra_args,
-                )
-            else:
-                assert (
-                    fused_set_kv_buffer_arg is None
-                ), "save kv cache is not supported for fallback_rotary_embedding."
-                self.cos_sin_cache = self.cos_sin_cache.to(
-                    query.device, dtype=query.dtype
-                )
-                self.fallback_rotary_embedding(
-                    positions,
-                    query,
-                    key,
-                    self.head_size,
-                    self.cos_sin_cache,
-                    self.is_neox_style,
-                )
+            assert (
+                fused_set_kv_buffer_arg is None
+            ), "save kv cache is not supported for fallback_rotary_embedding."
+            self.cos_sin_cache = self.cos_sin_cache.to(
+                query.device, dtype=query.dtype
+            )
+            self.fallback_rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
         return query, key
 
     def extra_repr(self) -> str:
